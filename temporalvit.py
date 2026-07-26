@@ -1,40 +1,16 @@
 """
-TemporalViT robust experimental pipeline for sky-image-based PV power forecasting.
+Correct proposed architecture:
+- 64 x 64 grayscale images
+- 8 consecutive frames and 8 historical PV-power values
+- three stride-2 convolutional-stem layers
+- 8 x 8 feature grid = 64 tokens per frame
+- 512 visual tokens + one CLS token
+- embedding dimension 128
+- four transformer blocks and four attention heads
+- 128-dimensional historical-power encoder
 
-Designed for Google Colab and the SKIPP'D dataset from TorchGeo.
-
-Main improvements over the earlier script
------------------------------------------
-1. Leakage-resistant chronological day-based train/validation/test split.
-2. Sequences never cross day boundaries or large timestamp gaps.
-3. Persistence, power-only, image-only, CNN-LSTM, direct-patch ViT, and
-   proposed convolutional-stem TemporalViT comparisons.
-4. Key ablation studies.
-5. Repeated-seed experiments with mean ± standard deviation.
-6. Bootstrap confidence intervals and paired statistical testing.
-7. Parameter count, model size, profiler FLOPs, inference latency,
-   throughput, peak GPU memory, and epoch training time.
-8. Day-wise, scatter, residual, metric, efficiency, ablation, data-size,
-   and multi-horizon visualizations.
-9. Checkpoint resumption and permanent Google Drive saving.
-10. The corrected proposed architecture is:
-      - 64 x 64 grayscale input
-      - three stride-2 convolutional stem layers
-      - 8 x 8 feature grid = 64 tokens per frame
-      - 8 frames = 512 visual tokens + one CLS token
-      - embedding dimension 128
-      - four transformer blocks
-      - four attention heads
-      - 128-dimensional historical-power encoder
-
-IMPORTANT COMPUTE NOTE
-----------------------
-The full paper experiment is expensive. The code is intentionally staged.
-This completion version loads or resumes the previously trained main benchmark,
-then runs the three-seed ablation, multi-horizon, and data-size studies. It also
-generates persistence skill scores, day-wise and rapid-ramp analyses, day-block
-bootstrap confidence intervals, statistical tests, figures, and writing-ready
-Section 4 tables. Completed runs are skipped unless force_retrain is True.
+The cache contains 30,000 chronologically ordered raw records. Progress is
+reported every 5,000 cached records rather than every 500 records.
 """
 
 # ============================================================
@@ -110,6 +86,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from scipy.stats import wilcoxon
 import psutil
 
@@ -134,11 +111,14 @@ class ExperimentConfig:
     cache_dir: str = "/content/skippd_robust_cache"
     image_size: int = 64
     sequence_length: int = 8
-    forecast_horizon_minutes: int = 1
+    # The principal Results-section comparison is 10 minutes ahead.
+    forecast_horizon_minutes: int = 10
 
     # Use more than the earlier 8,000-sample experiment.
     # Set to None to process all available records when resources permit.
     max_raw_samples: Optional[int] = 30000
+    # Cache progress/checkpoint reporting interval requested by the user.
+    cache_progress_interval: int = 5000
 
     # Sequence validity
     max_allowed_gap_minutes: float = 2.5
@@ -172,22 +152,22 @@ class ExperimentConfig:
     drop_path_max: float = 0.10
     lstm_hidden: int = 128
 
-    # Repeated runs. Three seeds are recommended for the final paper.
+    # Independent runs used for all headline, ablation, and horizon results.
     main_seeds: Tuple[int, ...] = (42, 52, 62)
     ablation_seeds: Tuple[int, ...] = (42, 52, 62)
     multi_horizon_seeds: Tuple[int, ...] = (42, 52, 62)
     data_size_seeds: Tuple[int, ...] = (42, 52, 62)
 
-    # Staged experiment switches
+    # Experiments required by the manuscript Results section.
     run_main_benchmarks: bool = True
     run_ablations: bool = True
     run_multi_horizon: bool = True
-    run_data_size_study: bool = True
+    run_data_size_study: bool = False
 
-    # Additional analyses required for a strong Results and Discussion chapter.
-    run_forecast_skill_analysis: bool = True
-    run_daywise_ramp_analysis: bool = True
-    run_day_block_bootstrap: bool = True
+    # Optional supplementary analyses not required by the current Results section.
+    run_forecast_skill_analysis: bool = False
+    run_daywise_ramp_analysis: bool = False
+    run_day_block_bootstrap: bool = False
     ramp_event_quantile: float = 0.90
 
     # Continue with later experiments if an individual run fails. All failures
@@ -195,17 +175,22 @@ class ExperimentConfig:
     continue_on_error: bool = True
 
     # Main benchmark models. Keep all for a robust comparison.
+    # Models reported in the principal 10-minute comparison. Persistence is
+    # included in the multi-horizon experiment instead of Figure 5.
     main_models: Tuple[str, ...] = (
-        "persistence",
-        "power_only_lstm",
         "image_only_cnn_lstm",
         "cnn_lstm_baseline",
-        "direct_patch_temporal_vit",
         "temporal_vit_proposed",
     )
 
-    # Multi-horizon study
-    horizon_minutes: Tuple[int, ...] = (1, 5, 10, 15, 20, 25, 30)
+    # Results-section multi-horizon study. Every learned model is repeated
+    # with the three seeds above; persistence is deterministic and evaluated once.
+    horizon_minutes: Tuple[int, ...] = (5, 10, 12)
+    multi_horizon_models: Tuple[str, ...] = (
+        "persistence",
+        "cnn_lstm_baseline",
+        "temporal_vit_proposed",
+    )
 
     # Data-size study uses training-sequence counts. None means all training data.
     data_size_counts: Tuple[Optional[int], ...] = (2000, 5000, 10000, None)
@@ -219,13 +204,23 @@ class ExperimentConfig:
     latency_repetitions: int = 100
     profile_batch_size: int = 16
 
+    # Dates discussed in Section 4.3.1. If any are unavailable after filtering,
+    # the plotting code automatically selects replacement days.
+    representative_test_days: Tuple[str, ...] = (
+        "2017-06-18",
+        "2017-06-20",
+        "2017-06-21",
+        "2017-06-22",
+    )
+    figure_dpi: int = 350
+
     # Output
     project_folder_name: str = "TemporalViT_Robust_Paper_Study"
     # Fixed run folder so interrupted Colab sessions can resume the same experiment.
     # Change this name only when starting a genuinely new experiment.
-    run_folder_name: str = "TemporalViT_Robust_Chronological_Study_v1"
+    run_folder_name: str = "TemporalViT_Results_5_10_12_Seeded_v1"
     # Renamed image-storage folder requested by the user.
-    figure_folder_name: str = "TemporalViT_Robust_Paper_Figures"
+    figure_folder_name: str = "publication_figures"
     force_retrain: bool = False
 
     # Device
@@ -264,17 +259,73 @@ print("Run folder:", RUN_ROOT)
 print("All paper figures will be saved in:", FIGURE_DIR)
 
 # ============================================================
-# 3. REPRODUCIBILITY AND GENERAL UTILITIES
+# 3. REPRODUCIBILITY, VISUAL STYLE, AND GENERAL UTILITIES
 # ============================================================
 
 
+MODEL_COLORS: Dict[str, str] = {
+    "persistence": "#6B7280",
+    "image_only_cnn_lstm": "#D97706",
+    "cnn_lstm_baseline": "#2563EB",
+    "temporal_vit_proposed": "#059669",
+    "ablation": "#7C3AED",
+}
+
+
+def set_publication_style() -> None:
+    """Apply one restrained, journal-ready Matplotlib style globally."""
+    plt.rcParams.update(
+        {
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "savefig.facecolor": "white",
+            "font.family": "DejaVu Sans",
+            "font.size": 11,
+            "axes.titlesize": 13,
+            "axes.labelsize": 11,
+            "axes.titleweight": "semibold",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "grid.alpha": 0.20,
+            "grid.linestyle": "--",
+            "grid.linewidth": 0.7,
+            "legend.frameon": False,
+            "legend.fontsize": 10,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "lines.linewidth": 2.2,
+            "lines.markersize": 6,
+            "errorbar.capsize": 4,
+        }
+    )
+
+
+set_publication_style()
+
+
 def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, PyTorch, CUDA, and deterministic backend choices."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        # Compatibility with older PyTorch releases.
+        torch.use_deterministic_algorithms(True)
+
+
+def seed_worker(worker_id: int) -> None:
+    """Deterministically seed each DataLoader worker."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def to_jsonable(value: Any) -> Any:
@@ -308,13 +359,32 @@ def cleanup_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def style_axis(axis: plt.Axes) -> None:
+    axis.set_axisbelow(True)
+    axis.grid(True, axis="y", alpha=0.20, linestyle="--", linewidth=0.7)
+    axis.grid(False, axis="x")
+    axis.margins(x=0.03)
+
+
+def label_bar_container(axis: plt.Axes, container: Any, fmt: str = "%.3f") -> None:
+    try:
+        axis.bar_label(container, fmt=fmt, padding=3, fontsize=9)
+    except Exception:
+        pass
+
+
 def save_figure(fig: plt.Figure, stem: str) -> None:
-    """Save publication figures permanently to Google Drive as PNG and PDF."""
+    """Save each publication figure to Drive as high-resolution PNG/PDF/SVG."""
     png_path = FIGURE_DIR / f"{stem}.png"
     pdf_path = FIGURE_DIR / f"{stem}.pdf"
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    svg_path = FIGURE_DIR / f"{stem}.svg"
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
+    fig.savefig(png_path, dpi=CONFIG.figure_dpi, bbox_inches="tight")
     fig.savefig(pdf_path, bbox_inches="tight")
+    fig.savefig(svg_path, bbox_inches="tight")
     print("Saved figure:", png_path)
     plt.show()
     plt.close(fig)
@@ -495,7 +565,7 @@ def build_cache() -> Tuple[torch.Tensor, torch.Tensor, np.ndarray]:
         images.append(tensor_or_pil_to_uint8(find_image(sample)))
         powers.append(find_power(sample))
 
-        if (index + 1) % 500 == 0 or (index + 1) == total:
+        if (index + 1) % CONFIG.cache_progress_interval == 0 or (index + 1) == total:
             elapsed = time.time() - start
             print(f"Cached {index + 1}/{total} records in {elapsed:.1f}s")
 
@@ -794,11 +864,17 @@ def compute_training_power_stats(
 def make_loader(
     dataset: Dataset,
     shuffle: bool,
-    seed: int,
+    seed: Optional[int] = None,
     batch_size: Optional[int] = None,
 ) -> DataLoader:
-    generator = torch.Generator()
-    generator.manual_seed(seed)
+    # For the requested multi-horizon study, seed=None leaves shuffling
+    # unseeded and each model is trained only once. Optional seeded behavior
+    # is retained for the disabled auxiliary experiments.
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
     return DataLoader(
         dataset,
         batch_size=batch_size or CONFIG.batch_size,
@@ -806,6 +882,7 @@ def make_loader(
         num_workers=CONFIG.num_workers,
         pin_memory=(CONFIG.device == "cuda"),
         persistent_workers=(CONFIG.num_workers > 0),
+        worker_init_fn=seed_worker if seed is not None else None,
         generator=generator,
     )
 
@@ -813,7 +890,7 @@ def make_loader(
 def build_loader_bundle(
     split_starts: Dict[str, Sequence[int]],
     horizon_steps: int,
-    seed: int,
+    seed: Optional[int] = None,
     train_limit: Optional[int] = None,
 ) -> LoaderBundle:
     train_starts = list(split_starts["train"])
@@ -866,6 +943,17 @@ def build_loader_bundle(
         power_std=power_std,
         horizon_steps=horizon_steps,
     )
+
+
+def reset_loader_generators(bundle: LoaderBundle, seed: int) -> None:
+    """Give every model with the same seed the same initial mini-batch order."""
+    for offset, loader in enumerate(
+        (bundle.train_loader, bundle.val_loader, bundle.test_loader)
+    ):
+        generator = getattr(loader, "generator", None)
+        if generator is not None:
+            generator.manual_seed(seed + offset)
+
 
 # ============================================================
 # 8. MODEL DEFINITIONS
@@ -1276,7 +1364,7 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
     ),
     "cnn_lstm_baseline": ModelSpec(
         key="cnn_lstm_baseline",
-        label="CNN-LSTM baseline",
+        label="Multimodal CNN-LSTM",
         factory=lambda: CNNLSTMBaseline(CONFIG.sequence_length, CONFIG.lstm_hidden),
         learning_rate=CONFIG.lr_cnn_models,
         warmup_epochs=CONFIG.warmup_epochs,
@@ -1373,7 +1461,7 @@ def bootstrap_metric_intervals(
     targets: np.ndarray,
     predictions: np.ndarray,
     repetitions: int,
-    seed: int,
+    seed: Optional[int] = None,
 ) -> Dict[str, Dict[str, float]]:
     rng = np.random.default_rng(seed)
     n = len(targets)
@@ -1396,7 +1484,7 @@ def paired_sign_flip_permutation_test(
     baseline_abs_errors: np.ndarray,
     proposed_abs_errors: np.ndarray,
     repetitions: int,
-    seed: int,
+    seed: Optional[int] = None,
 ) -> Dict[str, float]:
     """One-sided test of whether baseline absolute errors exceed proposed errors."""
     differences = baseline_abs_errors - proposed_abs_errors
@@ -1534,7 +1622,7 @@ def evaluate_model(
 class RunResult:
     model_key: str
     model_label: str
-    seed: int
+    seed: Optional[int]
     model: nn.Module
     history: pd.DataFrame
     metrics: Dict[str, float]
@@ -1548,33 +1636,47 @@ class RunResult:
 
 def train_or_load_model(
     spec: ModelSpec,
-    seed: int,
+    seed: Optional[int],
     loaders: LoaderBundle,
     experiment_group: str,
 ) -> RunResult:
-    set_seed(seed)
-    run_dir = CHECKPOINT_DIR / experiment_group / spec.key / f"seed_{seed}"
+    if spec.trainable and seed is None:
+        raise ValueError(
+            f"A deterministic seed is required for trainable model '{spec.key}'."
+        )
+    if seed is not None:
+        set_seed(seed)
+        run_tag = f"seed_{seed}"
+    else:
+        run_tag = "single_run"
+
+    run_dir = CHECKPOINT_DIR / experiment_group / spec.key / run_tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
     best_path = run_dir / "best_model.pt"
     last_path = run_dir / "last_training_state.pt"
     history_path = run_dir / "history.csv"
     metrics_path = run_dir / "metrics.json"
-    predictions_path = PREDICTION_DIR / experiment_group / f"{spec.key}_seed_{seed}.csv"
+    predictions_path = PREDICTION_DIR / experiment_group / f"{spec.key}_{run_tag}.csv"
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
 
     model = spec.factory().to(CONFIG.device)
 
     if (
         metrics_path.exists()
-        and history_path.exists()
         and predictions_path.exists()
         and best_path.exists()
         and not CONFIG.force_retrain
     ):
-        print(f"Loading completed run: {experiment_group}/{spec.key}/seed_{seed}")
+        print(f"Loading completed run: {experiment_group}/{spec.key}/{run_tag}")
         model.load_state_dict(torch.load(best_path, map_location=CONFIG.device))
-        history = pd.read_csv(history_path)
+        if history_path.exists() and history_path.stat().st_size > 1:
+            try:
+                history = pd.read_csv(history_path)
+            except pd.errors.EmptyDataError:
+                history = pd.DataFrame()
+        else:
+            history = pd.DataFrame()
         stored = json.loads(metrics_path.read_text(encoding="utf-8"))
         prediction_frame = pd.read_csv(predictions_path)
         return RunResult(
@@ -1606,7 +1708,8 @@ def train_or_load_model(
         torch.save(model.state_dict(), best_path)
     else:
         print("\n" + "=" * 80)
-        print(f"Training {spec.label} | seed={seed}")
+        run_description = f"seed={seed}" if seed is not None else "single unseeded run"
+        print(f"Training {spec.label} | {run_description}")
         print("Trainable parameters:", count_parameters(model))
         print("=" * 80)
 
@@ -1740,6 +1843,9 @@ def train_or_load_model(
             loaders.power_mean,
             loaders.power_std,
         )
+
+    if not history_path.exists():
+        history.to_csv(history_path, index=False)
 
     prediction_frame = pd.DataFrame(
         {
@@ -1911,7 +2017,7 @@ def save_pipeline_heartbeat(message: str) -> None:
 def record_failed_run(
     experiment_group: str,
     model_key: str,
-    seed: int,
+    seed: Optional[int],
     exc: BaseException,
 ) -> None:
     failure = {
@@ -1953,6 +2059,7 @@ def run_model_set(
             print("\n" + status)
             save_pipeline_heartbeat(status)
             try:
+                reset_loader_generators(loaders_by_seed[seed], seed)
                 outputs[(key, seed)] = train_or_load_model(
                     spec,
                     seed,
@@ -2020,14 +2127,16 @@ def aggregate_results(long_frame: pd.DataFrame) -> pd.DataFrame:
 # 14. MAIN BENCHMARKS
 # ============================================================
 
-main_loaders_by_seed: Dict[int, LoaderBundle] = {
-    seed: build_loader_bundle(
-        main_split_starts,
-        MAIN_HORIZON_STEPS,
-        seed,
-    )
-    for seed in CONFIG.main_seeds
-}
+main_loaders_by_seed: Dict[int, LoaderBundle] = {}
+if CONFIG.run_main_benchmarks:
+    main_loaders_by_seed = {
+        seed: build_loader_bundle(
+            main_split_starts,
+            MAIN_HORIZON_STEPS,
+            seed,
+        )
+        for seed in CONFIG.main_seeds
+    }
 
 main_results: Dict[Tuple[str, int], RunResult] = {}
 main_long = pd.DataFrame()
@@ -2146,48 +2255,46 @@ if main_results:
 # ============================================================
 
 
+PAPER_MAIN_MODEL_ORDER = (
+    "image_only_cnn_lstm",
+    "cnn_lstm_baseline",
+    "temporal_vit_proposed",
+)
+
+
+def model_seed_results(
+    model_key: str,
+    source: Optional[Dict[Tuple[str, int], RunResult]] = None,
+) -> List[RunResult]:
+    source = main_results if source is None else source
+    matches = [result for (key, _), result in source.items() if key == model_key]
+    return sorted(matches, key=lambda item: int(item.seed or 0))
+
+
 def first_seed_result(model_key: str) -> Optional[RunResult]:
-    matches = [result for (key, _), result in main_results.items() if key == model_key]
-    return sorted(matches, key=lambda item: item.seed)[0] if matches else None
+    matches = model_seed_results(model_key)
+    return matches[0] if matches else None
 
 
-def plot_training_and_validation_loss() -> None:
-    baseline = first_seed_result("cnn_lstm_baseline")
-    proposed = first_seed_result("temporal_vit_proposed")
-    if baseline is None or proposed is None:
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(baseline.history["epoch"], baseline.history["train_loss"], label="Baseline train loss")
-    ax.plot(baseline.history["epoch"], baseline.history["val_loss"], label="Baseline validation loss")
-    ax.plot(proposed.history["epoch"], proposed.history["train_loss"], label="Proposed train loss")
-    ax.plot(proposed.history["epoch"], proposed.history["val_loss"], label="Proposed validation loss")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Normalized MSE loss")
-    ax.set_title("Training and Validation Loss")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    save_figure(fig, "Fig04_training_validation_loss")
-
-
-def plot_epoch_training_time() -> None:
-    baseline = first_seed_result("cnn_lstm_baseline")
-    proposed = first_seed_result("temporal_vit_proposed")
-    if baseline is None or proposed is None:
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(baseline.history["epoch"], baseline.history["epoch_time_seconds"], label="Baseline epoch time")
-    ax.plot(proposed.history["epoch"], proposed.history["epoch_time_seconds"], label="Proposed epoch time")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Seconds")
-    ax.set_title("Epoch Training Time")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    save_figure(fig, "Fig05_epoch_training_time")
+def aggregate_history_column(
+    model_key: str,
+    column: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    runs = [r for r in model_seed_results(model_key) if not r.history.empty and column in r.history]
+    if not runs:
+        return np.array([]), np.array([]), np.array([])
+    common_epochs = min(len(r.history) for r in runs)
+    epochs = runs[0].history["epoch"].to_numpy(dtype=float)[:common_epochs]
+    values = np.vstack(
+        [r.history[column].to_numpy(dtype=float)[:common_epochs] for r in runs]
+    )
+    mean = values.mean(axis=0)
+    std = values.std(axis=0, ddof=1) if len(runs) > 1 else np.zeros(common_epochs)
+    return epochs, mean, std
 
 
 def prediction_frame_from_result(result: RunResult) -> pd.DataFrame:
+    """Return one run's predictions with timestamps for optional analyses."""
     return pd.DataFrame(
         {
             "target_index": result.target_indices,
@@ -2198,184 +2305,389 @@ def prediction_frame_from_result(result: RunResult) -> pd.DataFrame:
     ).sort_values("timestamp")
 
 
-def select_day_panels(result: RunResult, minimum_points: int = 20) -> List[pd.Timestamp]:
-    frame = prediction_frame_from_result(result)
-    frame["day"] = frame["timestamp"].dt.date
-    roughness = []
-    for day, group in frame.groupby("day"):
-        ordered = group.sort_values("timestamp")
-        if len(ordered) < minimum_points:
-            continue
-        diffs = np.diff(ordered["actual"].to_numpy())
-        roughness.append((day, float(np.var(diffs))))
-
-    roughness.sort(key=lambda item: item[1])
-    if len(roughness) < 4:
-        return [pd.Timestamp(day) for day, _ in roughness]
-    selected = roughness[:2] + roughness[-2:]
-    return [pd.Timestamp(day) for day, _ in selected]
-
-
-def plot_daywise(result: RunResult, stem: str, title: str) -> None:
-    frame = prediction_frame_from_result(result)
-    frame["day"] = frame["timestamp"].dt.date
-    selected_days = select_day_panels(result)
-    if not selected_days:
-        return
-
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes = axes.reshape(-1)
-
-    for axis, day_ts in zip(axes, selected_days):
-        day = day_ts.date()
-        group = frame[frame["day"] == day].sort_values("timestamp")
-        axis.plot(group["timestamp"], group["actual"], label="Actual PV power")
-        axis.plot(group["timestamp"], group["predicted"], label="Predicted PV power")
-        axis.set_title(f"Actual vs predicted power for {day}")
-        axis.set_xlabel("Time")
-        axis.set_ylabel("PV power")
-        axis.grid(True, alpha=0.3)
-        axis.legend()
-        axis.tick_params(axis="x", rotation=30)
-
-    for axis in axes[len(selected_days):]:
-        axis.axis("off")
-
-    fig.suptitle(title, y=1.01)
-    save_figure(fig, stem)
-
-
-def plot_combined_scatter() -> None:
-    baseline = first_seed_result("cnn_lstm_baseline")
-    proposed = first_seed_result("temporal_vit_proposed")
-    if baseline is None or proposed is None:
-        return
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharex=True, sharey=True)
-    pairs = [
-        (baseline, "(a) CNN-LSTM baseline"),
-        (proposed, "(b) Proposed TemporalViT"),
-    ]
-    all_values = np.concatenate([baseline.targets, baseline.predictions, proposed.targets, proposed.predictions])
-    low, high = float(np.min(all_values)), float(np.max(all_values))
-
-    for axis, (result, title) in zip(axes, pairs):
-        axis.scatter(result.targets, result.predictions, alpha=0.45)
-        axis.plot([low, high], [low, high], linestyle="--", label="Perfect prediction")
-        axis.set_title(title)
-        axis.set_xlabel("Actual PV power")
-        axis.set_ylabel("Predicted PV power")
-        axis.grid(True, alpha=0.3)
-        axis.legend()
-
-    save_figure(fig, "Fig08_actual_vs_predicted_scatter")
-
-
-def plot_residual_distributions() -> None:
-    baseline = first_seed_result("cnn_lstm_baseline")
-    proposed = first_seed_result("temporal_vit_proposed")
-    if baseline is None or proposed is None:
-        return
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    axes[0].hist(baseline.predictions - baseline.targets, bins=40, alpha=0.7, label="CNN-LSTM")
-    axes[0].hist(proposed.predictions - proposed.targets, bins=40, alpha=0.7, label="TemporalViT")
-    axes[0].axvline(0.0, linestyle="--")
-    axes[0].set_xlabel("Prediction residual")
-    axes[0].set_ylabel("Frequency")
-    axes[0].set_title("Residual Distribution")
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].scatter(baseline.targets, baseline.predictions - baseline.targets, alpha=0.35, label="CNN-LSTM")
-    axes[1].scatter(proposed.targets, proposed.predictions - proposed.targets, alpha=0.35, label="TemporalViT")
-    axes[1].axhline(0.0, linestyle="--")
-    axes[1].set_xlabel("Actual PV power")
-    axes[1].set_ylabel("Residual")
-    axes[1].set_title("Residuals versus Actual Power")
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-
-    save_figure(fig, "Fig10_residual_analysis")
+def aggregate_predictions_for_model(model_key: str) -> pd.DataFrame:
+    runs = model_seed_results(model_key)
+    if not runs:
+        return pd.DataFrame()
+    frames = []
+    for result in runs:
+        frames.append(
+            pd.DataFrame(
+                {
+                    "target_index": result.target_indices.astype(np.int64),
+                    "target": result.targets,
+                    "prediction": result.predictions,
+                    "seed": result.seed,
+                }
+            )
+        )
+    long_frame = pd.concat(frames, ignore_index=True)
+    aggregated = (
+        long_frame.groupby("target_index", as_index=False)
+        .agg(
+            actual=("target", "first"),
+            predicted=("prediction", "mean"),
+            prediction_std=("prediction", lambda x: float(np.std(x, ddof=1)) if len(x) > 1 else 0.0),
+            seed_runs=("seed", "nunique"),
+        )
+        .sort_values("target_index")
+    )
+    aggregated["timestamp"] = pd.to_datetime(
+        cached_timestamps[aggregated["target_index"].to_numpy(dtype=np.int64)]
+    )
+    return aggregated
 
 
 def plot_main_metric_comparison() -> None:
     if main_summary.empty:
         return
-    ordered = main_summary.copy()
-    metrics = ["mae_mean", "rmse_mean"]
-    x = np.arange(len(ordered))
-    width = 0.35
+    frame = main_summary[main_summary["model_key"].isin(PAPER_MAIN_MODEL_ORDER)].copy()
+    frame["order"] = frame["model_key"].map(
+        {key: index for index, key in enumerate(PAPER_MAIN_MODEL_ORDER)}
+    )
+    frame = frame.sort_values("order")
+    labels = ["Image-only\nCNN-LSTM", "Multimodal\nCNN-LSTM", "Proposed\nTemporalViT"]
+    x = np.arange(len(frame))
+    width = 0.34
+    colors = [MODEL_COLORS[key] for key in frame["model_key"]]
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    axes[0].bar(x - width / 2, ordered[metrics[0]], width, yerr=ordered.get("mae_std", 0), label="MAE")
-    axes[0].bar(x + width / 2, ordered[metrics[1]], width, yerr=ordered.get("rmse_std", 0), label="RMSE")
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(ordered["model"], rotation=30, ha="right")
-    axes[0].set_ylabel("Error")
-    axes[0].set_title("Forecasting Error Comparison")
+    fig, ax = plt.subplots(figsize=(10.8, 6.4))
+    mae_bars = ax.bar(
+        x - width / 2,
+        frame["mae_mean"],
+        width,
+        yerr=frame["mae_std"],
+        color=colors,
+        alpha=0.82,
+        edgecolor="white",
+        linewidth=0.8,
+        label="MAE",
+    )
+    rmse_bars = ax.bar(
+        x + width / 2,
+        frame["rmse_mean"],
+        width,
+        yerr=frame["rmse_std"],
+        color=colors,
+        alpha=0.48,
+        edgecolor=colors,
+        linewidth=1.4,
+        hatch="//",
+        label="RMSE",
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Forecasting error")
+    ax.set_title("10-minute-ahead forecasting performance")
+    ax.legend(ncol=2, loc="upper right")
+    style_axis(ax)
+    label_bar_container(ax, mae_bars)
+    label_bar_container(ax, rmse_bars)
+    fig.text(
+        0.5,
+        -0.01,
+        "Bars show mean ± standard deviation across seeds 42, 52, and 62.",
+        ha="center",
+        fontsize=9,
+    )
+    save_figure(fig, "Fig05_10min_MAE_RMSE_mean_std")
+
+
+def plot_training_and_validation_loss() -> None:
+    if not main_results:
+        return
+    fig, ax = plt.subplots(figsize=(11.5, 6.7))
+    labels = {
+        "image_only_cnn_lstm": "Image-only CNN-LSTM",
+        "cnn_lstm_baseline": "Multimodal CNN-LSTM",
+        "temporal_vit_proposed": "Proposed TemporalViT",
+    }
+    rows: List[Dict[str, Any]] = []
+    for model_key in PAPER_MAIN_MODEL_ORDER:
+        color = MODEL_COLORS[model_key]
+        for column, linestyle, suffix in (
+            ("train_loss", "-", "train"),
+            ("val_loss", "--", "validation"),
+        ):
+            epochs, mean, std = aggregate_history_column(model_key, column)
+            if len(epochs) == 0:
+                continue
+            ax.plot(
+                epochs,
+                mean,
+                linestyle=linestyle,
+                color=color,
+                label=f"{labels[model_key]} — {suffix}",
+            )
+            ax.fill_between(epochs, mean - std, mean + std, color=color, alpha=0.08)
+            rows.extend(
+                {
+                    "model_key": model_key,
+                    "series": suffix,
+                    "epoch": int(epoch),
+                    "mean": float(mu),
+                    "std": float(sd),
+                }
+                for epoch, mu, sd in zip(epochs, mean, std)
+            )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Normalized MSE loss")
+    ax.set_title("Mean training and validation loss across three seeds")
+    ax.legend(ncol=2, fontsize=9)
+    style_axis(ax)
+    pd.DataFrame(rows).to_csv(TABLE_DIR / "figure06_mean_loss_curves.csv", index=False)
+    save_figure(fig, "Fig06_mean_training_validation_loss")
+
+
+def plot_epoch_training_time() -> None:
+    if not main_results:
+        return
+    fig, ax = plt.subplots(figsize=(11.5, 6.3))
+    labels = {
+        "image_only_cnn_lstm": "Image-only CNN-LSTM",
+        "cnn_lstm_baseline": "Multimodal CNN-LSTM",
+        "temporal_vit_proposed": "Proposed TemporalViT",
+    }
+    rows: List[Dict[str, Any]] = []
+    for model_key in PAPER_MAIN_MODEL_ORDER:
+        epochs, mean, std = aggregate_history_column(model_key, "epoch_time_seconds")
+        if len(epochs) == 0:
+            continue
+        color = MODEL_COLORS[model_key]
+        ax.plot(epochs, mean, color=color, label=labels[model_key])
+        ax.fill_between(epochs, mean - std, mean + std, color=color, alpha=0.14)
+        rows.extend(
+            {
+                "model_key": model_key,
+                "epoch": int(epoch),
+                "mean_seconds": float(mu),
+                "std_seconds": float(sd),
+            }
+            for epoch, mu, sd in zip(epochs, mean, std)
+        )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Training time per epoch (seconds)")
+    ax.set_title("Mean per-epoch training time across three seeds")
+    ax.legend(ncol=3, loc="upper center")
+    style_axis(ax)
+    pd.DataFrame(rows).to_csv(TABLE_DIR / "figure07_mean_epoch_times.csv", index=False)
+    save_figure(fig, "Fig07_mean_epoch_training_time")
+
+
+def choose_representative_days(frame: pd.DataFrame, minimum_points: int = 20) -> List[pd.Timestamp]:
+    available_days = set(frame["timestamp"].dt.normalize().unique())
+    chosen: List[pd.Timestamp] = []
+    for date_string in CONFIG.representative_test_days:
+        day = pd.Timestamp(date_string)
+        if day.to_datetime64() in available_days:
+            chosen.append(day)
+
+    if len(chosen) >= 4:
+        return chosen[:4]
+
+    candidate_rows = []
+    work = frame.copy()
+    work["day"] = work["timestamp"].dt.normalize()
+    for day, group in work.groupby("day"):
+        if len(group) < minimum_points or day in chosen:
+            continue
+        ordered = group.sort_values("timestamp")
+        roughness = float(np.var(np.diff(ordered["actual"].to_numpy())))
+        amplitude = float(ordered["actual"].max() - ordered["actual"].min())
+        candidate_rows.append((pd.Timestamp(day), roughness, amplitude))
+    candidate_rows.sort(key=lambda row: (row[1], row[2]))
+    fallback = [row[0] for row in candidate_rows[:2]] + [row[0] for row in candidate_rows[-2:]]
+    for day in fallback:
+        if day not in chosen:
+            chosen.append(day)
+        if len(chosen) == 4:
+            break
+    return chosen
+
+
+def plot_daywise_seed_mean(model_key: str, stem: str, title: str) -> None:
+    frame = aggregate_predictions_for_model(model_key)
+    if frame.empty:
+        return
+    frame["day"] = frame["timestamp"].dt.normalize()
+    selected_days = choose_representative_days(frame)
+    if not selected_days:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(15.2, 9.7), sharey=False)
+    axes = axes.reshape(-1)
+    color = MODEL_COLORS[model_key]
+    for axis, day in zip(axes, selected_days):
+        group = frame[frame["day"] == day].sort_values("timestamp")
+        axis.plot(group["timestamp"], group["actual"], color="#111827", label="Actual PV power")
+        axis.plot(group["timestamp"], group["predicted"], color=color, label="Mean predicted PV power")
+        axis.fill_between(
+            group["timestamp"],
+            group["predicted"] - group["prediction_std"],
+            group["predicted"] + group["prediction_std"],
+            color=color,
+            alpha=0.14,
+            label="±1 SD across seeds",
+        )
+        axis.set_title(day.strftime("%d %B %Y"))
+        axis.set_xlabel("Time")
+        axis.set_ylabel("PV power")
+        axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        axis.tick_params(axis="x", rotation=25)
+        style_axis(axis)
+    for axis in axes[len(selected_days):]:
+        axis.axis("off")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.01))
+    fig.suptitle(title, y=1.045, fontsize=14, fontweight="semibold")
+    save_figure(fig, stem)
+
+
+def plot_combined_scatter() -> None:
+    baseline = aggregate_predictions_for_model("cnn_lstm_baseline")
+    proposed = aggregate_predictions_for_model("temporal_vit_proposed")
+    if baseline.empty or proposed.empty:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(13.8, 6.2), sharex=True, sharey=True)
+    pairs = [
+        (baseline, "cnn_lstm_baseline", "(a) Multimodal CNN-LSTM"),
+        (proposed, "temporal_vit_proposed", "(b) Proposed TemporalViT"),
+    ]
+    all_values = np.concatenate(
+        [baseline["actual"], baseline["predicted"], proposed["actual"], proposed["predicted"]]
+    )
+    low, high = float(np.min(all_values)), float(np.max(all_values))
+    for axis, (frame, model_key, title) in zip(axes, pairs):
+        axis.scatter(
+            frame["actual"],
+            frame["predicted"],
+            s=20,
+            alpha=0.38,
+            color=MODEL_COLORS[model_key],
+            edgecolors="none",
+        )
+        axis.plot([low, high], [low, high], linestyle="--", color="#111827", label="Perfect agreement")
+        metrics = regression_metrics(frame["actual"].to_numpy(), frame["predicted"].to_numpy())
+        axis.text(
+            0.04,
+            0.95,
+            f"MAE = {metrics['mae']:.3f}\nRMSE = {metrics['rmse']:.3f}\nR² = {metrics['r2']:.3f}",
+            transform=axis.transAxes,
+            va="top",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.88, edgecolor="#D1D5DB"),
+        )
+        axis.set_title(title)
+        axis.set_xlabel("Actual PV power")
+        axis.set_ylabel("Predicted PV power")
+        axis.legend(loc="lower right")
+        axis.grid(True, alpha=0.18, linestyle="--")
+        axis.set_aspect("equal", adjustable="box")
+    save_figure(fig, "Fig10_actual_vs_predicted_seed_mean")
+
+
+def plot_residual_distributions() -> None:
+    baseline = aggregate_predictions_for_model("cnn_lstm_baseline")
+    proposed = aggregate_predictions_for_model("temporal_vit_proposed")
+    if baseline.empty or proposed.empty:
+        return
+    baseline_residual = baseline["predicted"] - baseline["actual"]
+    proposed_residual = proposed["predicted"] - proposed["actual"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14.2, 6.0))
+    bins = np.linspace(
+        min(float(baseline_residual.min()), float(proposed_residual.min())),
+        max(float(baseline_residual.max()), float(proposed_residual.max())),
+        45,
+    )
+    axes[0].hist(
+        baseline_residual,
+        bins=bins,
+        density=True,
+        alpha=0.45,
+        color=MODEL_COLORS["cnn_lstm_baseline"],
+        label="Multimodal CNN-LSTM",
+    )
+    axes[0].hist(
+        proposed_residual,
+        bins=bins,
+        density=True,
+        alpha=0.55,
+        color=MODEL_COLORS["temporal_vit_proposed"],
+        label="Proposed TemporalViT",
+    )
+    axes[0].axvline(0.0, linestyle="--", color="#111827")
+    axes[0].set_xlabel("Residual (predicted − actual)")
+    axes[0].set_ylabel("Density")
+    axes[0].set_title("(a) Residual distribution")
     axes[0].legend()
-    axes[0].grid(True, axis="y", alpha=0.3)
+    style_axis(axes[0])
 
-    axes[1].bar(x, ordered["r2_mean"], yerr=ordered.get("r2_std", 0))
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(ordered["model"], rotation=30, ha="right")
-    axes[1].set_ylabel("R²")
-    axes[1].set_title("Coefficient of Determination")
-    axes[1].grid(True, axis="y", alpha=0.3)
-
-    save_figure(fig, "Fig11_main_model_metric_comparison")
+    axes[1].scatter(
+        baseline["actual"], baseline_residual, s=17, alpha=0.28,
+        color=MODEL_COLORS["cnn_lstm_baseline"], label="Multimodal CNN-LSTM"
+    )
+    axes[1].scatter(
+        proposed["actual"], proposed_residual, s=17, alpha=0.32,
+        color=MODEL_COLORS["temporal_vit_proposed"], label="Proposed TemporalViT"
+    )
+    axes[1].axhline(0.0, linestyle="--", color="#111827")
+    axes[1].set_xlabel("Actual PV power")
+    axes[1].set_ylabel("Residual (predicted − actual)")
+    axes[1].set_title("(b) Residuals versus actual power")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.18, linestyle="--")
+    save_figure(fig, "Fig12_residual_and_forecast_error_analysis")
 
 
 def plot_efficiency_comparison() -> None:
     if efficiency_frame.empty:
         return
+    frame = efficiency_frame[efficiency_frame["model_key"].isin(PAPER_MAIN_MODEL_ORDER)].copy()
+    frame["order"] = frame["model_key"].map(
+        {key: index for index, key in enumerate(PAPER_MAIN_MODEL_ORDER)}
+    )
+    frame = frame.sort_values("order")
+    labels = ["Image-only\nCNN-LSTM", "Multimodal\nCNN-LSTM", "Proposed\nTemporalViT"]
+    colors = [MODEL_COLORS[key] for key in frame["model_key"]]
+    frame["parameters_millions"] = frame["parameters"] / 1e6
 
-    frame = efficiency_frame.copy()
-    x = np.arange(len(frame))
-    fig, axes = plt.subplots(2, 2, figsize=(15, 11))
-    axes = axes.reshape(-1)
-
-    columns = [
-        ("parameters", "Trainable parameters"),
-        ("model_size_mb", "Model size (MB)"),
-        ("inference_latency_ms_per_sample", "Inference latency (ms/sample)"),
-        ("peak_inference_memory_mb", "Peak inference memory (MB)"),
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 10.2))
+    panels = [
+        ("parameters_millions", "(a) Trainable parameters", "Parameters (millions)", "%.3f"),
+        ("model_size_mb", "(b) Model size", "Model size (MB)", "%.2f"),
+        ("inference_latency_ms_per_sample", "(c) Inference latency", "Milliseconds per sample", "%.3f"),
+        ("peak_inference_memory_mb", "(d) Peak inference memory", "Memory (MB)", "%.1f"),
     ]
-
-    for axis, (column, title) in zip(axes, columns):
-        axis.bar(x, frame[column])
+    x = np.arange(len(frame))
+    for axis, (column, title, ylabel, fmt) in zip(axes.reshape(-1), panels):
+        bars = axis.bar(x, frame[column], color=colors, alpha=0.86, edgecolor="white")
         axis.set_xticks(x)
-        axis.set_xticklabels(frame["model_label"], rotation=30, ha="right")
+        axis.set_xticklabels(labels)
         axis.set_title(title)
-        axis.grid(True, axis="y", alpha=0.3)
-
-    save_figure(fig, "Fig12_computational_efficiency")
+        axis.set_ylabel(ylabel)
+        style_axis(axis)
+        label_bar_container(axis, bars, fmt)
+    save_figure(fig, "Fig13_computational_efficiency")
 
 
 if main_results:
+    plot_main_metric_comparison()
     plot_training_and_validation_loss()
     plot_epoch_training_time()
-
-    baseline_result = first_seed_result("cnn_lstm_baseline")
-    proposed_result = first_seed_result("temporal_vit_proposed")
-    if baseline_result is not None:
-        plot_daywise(
-            baseline_result,
-            "Fig06_daywise_cnn_lstm_baseline",
-            "CNN-LSTM Baseline: Actual versus Predicted PV Power",
-        )
-    if proposed_result is not None:
-        plot_daywise(
-            proposed_result,
-            "Fig07_daywise_temporal_vit_proposed",
-            "Proposed TemporalViT: Actual versus Predicted PV Power",
-        )
-
+    plot_daywise_seed_mean(
+        "cnn_lstm_baseline",
+        "Fig08_daywise_multimodal_CNN_LSTM",
+        "Multimodal CNN-LSTM: actual and predicted PV power",
+    )
+    plot_daywise_seed_mean(
+        "temporal_vit_proposed",
+        "Fig09_daywise_proposed_TemporalViT",
+        "Proposed TemporalViT: actual and predicted PV power",
+    )
     plot_combined_scatter()
     plot_residual_distributions()
-    plot_main_metric_comparison()
     plot_efficiency_comparison()
+
 
 # ============================================================
 # 17. ABLATION STUDY
@@ -2446,10 +2758,10 @@ if CONFIG.run_ablations:
             direct_result = main_results.get(("direct_patch_temporal_vit", seed))
             if direct_result is None:
                 direct_result = train_or_load_model(
-                    MODEL_SPECS["direct_patch_temporal_vit"],
+                    ABLATION_SPECS["ablation_no_conv_stem"],
                     seed,
                     loaders,
-                    experiment_group="main_benchmarks",
+                    experiment_group="ablations",
                 )
             ablation_results[("ablation_no_conv_stem", seed)] = alias_run_result(
                 direct_result,
@@ -2483,10 +2795,10 @@ if CONFIG.run_ablations:
 
         ablation_order = [
             "temporal_vit_proposed",
-            "ablation_no_conv_stem",
+            "ablation_no_power",
             "ablation_no_temporal_pos",
             "ablation_no_spatial_pos",
-            "ablation_no_power",
+            "ablation_no_conv_stem",
             "ablation_no_droppath",
         ]
         ablation_summary["order"] = ablation_summary["model_key"].map(
@@ -2585,35 +2897,57 @@ if CONFIG.run_ablations:
             TABLE_DIR / "ablation_paired_statistical_tests.csv", index=False
         )
 
-        fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+        fig, axes = plt.subplots(1, 3, figsize=(20.5, 6.6))
         x = np.arange(len(ablation_summary))
-        labels = ablation_summary["model"].tolist()
-        panels = [
-            ("mae_mean", "mae_std", "MAE", "(a) Mean Absolute Error"),
-            ("rmse_mean", "rmse_std", "RMSE", "(b) Root Mean Squared Error"),
-            ("r2_mean", "r2_std", "R²", "(c) Coefficient of Determination"),
+        short_labels = {
+            "temporal_vit_proposed": "Complete",
+            "ablation_no_power": "No power\nfusion",
+            "ablation_no_temporal_pos": "No temporal\nembedding",
+            "ablation_no_spatial_pos": "No spatial\nembedding",
+            "ablation_no_conv_stem": "No convolutional\nstem",
+            "ablation_no_droppath": "No DropPath",
+        }
+        labels = [short_labels[key] for key in ablation_summary["model_key"]]
+        colors = [
+            MODEL_COLORS["temporal_vit_proposed"]
+            if key == "temporal_vit_proposed"
+            else MODEL_COLORS["ablation"]
+            for key in ablation_summary["model_key"]
         ]
-        for axis, (mean_col, std_col, ylabel, title) in zip(axes, panels):
-            axis.bar(
+        panels = [
+            ("mae_mean", "mae_std", "MAE", "(a) Mean absolute error", "%.3f"),
+            ("rmse_mean", "rmse_std", "RMSE", "(b) Root mean squared error", "%.3f"),
+            ("r2_mean", "r2_std", "R²", "(c) Coefficient of determination", "%.3f"),
+        ]
+        for axis, (mean_col, std_col, ylabel, title, fmt) in zip(axes, panels):
+            bars = axis.bar(
                 x,
                 ablation_summary[mean_col],
-                yerr=ablation_summary.get(std_col, 0.0),
-                capsize=4,
+                yerr=ablation_summary[std_col],
+                color=colors,
+                alpha=0.86,
+                edgecolor="white",
+                linewidth=0.8,
             )
             axis.set_xticks(x)
-            axis.set_xticklabels(labels, rotation=32, ha="right")
+            axis.set_xticklabels(labels, rotation=18, ha="right")
             axis.set_ylabel(ylabel)
             axis.set_title(title)
-            axis.grid(True, axis="y", alpha=0.3)
-        save_figure(fig, "Fig13_ablation_study")
+            style_axis(axis)
+            label_bar_container(axis, bars, fmt)
+        fig.suptitle("Component-level TemporalViT ablation study (mean ± SD)", y=1.02)
+        save_figure(fig, "Fig14_complete_ablation_study")
 
 
 # ============================================================
-# 18. MULTI-HORIZON FORECASTING STUDY
+# 18. SEEDED MULTI-HORIZON FORECASTING STUDY: 5, 10, AND 12 MINUTES
 # ============================================================
 
 multi_horizon_results: Dict[Tuple[int, str, int], RunResult] = {}
+multi_horizon_long = pd.DataFrame()
 multi_horizon_summary = pd.DataFrame()
+multi_horizon_skill_long = pd.DataFrame()
+multi_horizon_skill_scores = pd.DataFrame()
 multi_horizon_tests = pd.DataFrame()
 
 
@@ -2624,279 +2958,419 @@ def fixed_split_for_horizon(horizon_steps: int) -> Dict[str, List[int]]:
         horizon_steps,
         CONFIG.max_allowed_gap_minutes,
     )
-    # Reuse the same calendar-day partitions so horizon comparisons are fair.
+    # All horizons use the same calendar-day train/validation/test periods as
+    # the principal 10-minute experiment, ensuring a fair horizon comparison.
     return split_starts_by_days(valid_starts, horizon_steps, MAIN_SPLIT_DAYS)
+
+
+def paired_error_test_row(
+    horizon_minutes: int,
+    seed: int,
+    reference: RunResult,
+    candidate: RunResult,
+) -> Dict[str, Any]:
+    """Compare candidate and reference absolute errors on aligned test targets."""
+    targets, reference_preds, candidate_preds = align_predictions(reference, candidate)
+    reference_abs = np.abs(reference_preds - targets)
+    candidate_abs = np.abs(candidate_preds - targets)
+
+    try:
+        test = wilcoxon(
+            reference_abs,
+            candidate_abs,
+            alternative="greater",
+            zero_method="wilcox",
+        )
+        statistic = float(test.statistic)
+        p_value = float(test.pvalue)
+    except ValueError:
+        statistic = float("nan")
+        p_value = float("nan")
+
+    permutation = paired_sign_flip_permutation_test(
+        reference_abs,
+        candidate_abs,
+        CONFIG.permutation_repetitions,
+        seed=seed,
+    )
+    return {
+        "horizon_minutes": horizon_minutes,
+        "seed": seed,
+        "reference_model_key": reference.model_key,
+        "reference_model": reference.model_label,
+        "candidate_model_key": candidate.model_key,
+        "candidate_model": candidate.model_label,
+        "reference_mae": float(np.mean(reference_abs)),
+        "candidate_mae": float(np.mean(candidate_abs)),
+        "candidate_mae_reduction_percent": float(
+            100.0
+            * (np.mean(reference_abs) - np.mean(candidate_abs))
+            / max(np.mean(reference_abs), 1e-12)
+        ),
+        "wilcoxon_statistic": statistic,
+        "wilcoxon_one_sided_p_value": p_value,
+        **permutation,
+    }
+
+
+def aggregate_multi_horizon_frame(long_frame: pd.DataFrame) -> pd.DataFrame:
+    if long_frame.empty:
+        return pd.DataFrame()
+    metric_columns = [
+        "mae", "mse", "rmse", "r2", "mbe", "pearson_r", "nrmse_range",
+        "best_epoch", "total_training_seconds", "parameter_count",
+    ]
+    rows: List[Dict[str, Any]] = []
+    for (horizon, model_key, model), group in long_frame.groupby(
+        ["horizon_minutes", "model_key", "model"], sort=False
+    ):
+        row: Dict[str, Any] = {
+            "horizon_minutes": int(horizon),
+            "model_key": model_key,
+            "model": model,
+            "runs": int(group["seed"].nunique()),
+            "horizon_steps": int(group["horizon_steps"].iloc[0]),
+            "train_sequences": int(group["train_sequences"].iloc[0]),
+            "validation_sequences": int(group["validation_sequences"].iloc[0]),
+            "test_sequences": int(group["test_sequences"].iloc[0]),
+        }
+        for metric in metric_columns:
+            if metric not in group:
+                continue
+            values = group[metric].astype(float)
+            row[f"{metric}_mean"] = float(values.mean())
+            row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["horizon_minutes", "model_key"]).reset_index(drop=True)
+
+
+def aggregate_skill_frame(long_frame: pd.DataFrame) -> pd.DataFrame:
+    if long_frame.empty:
+        return pd.DataFrame()
+    metrics = [
+        "mae_skill_vs_persistence",
+        "rmse_skill_vs_persistence",
+        "mae_reduction_vs_persistence_percent",
+        "rmse_reduction_vs_persistence_percent",
+        "r2_difference_vs_persistence",
+    ]
+    rows = []
+    for (horizon, model_key, model), group in long_frame.groupby(
+        ["horizon_minutes", "model_key", "model"], sort=False
+    ):
+        row = {
+            "horizon_minutes": int(horizon),
+            "model_key": model_key,
+            "model": model,
+            "runs": int(group["seed"].nunique()),
+        }
+        for metric in metrics:
+            values = group[metric].astype(float)
+            row[f"{metric}_mean"] = float(values.mean())
+            row[f"{metric}_std"] = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["horizon_minutes", "model_key"]).reset_index(drop=True)
 
 
 if CONFIG.run_multi_horizon:
     print("\n" + "=" * 90)
-    print("STARTING MULTI-HORIZON FORECASTING STUDY")
+    print("STARTING SEEDED MULTI-HORIZON FORECASTING STUDY")
+    print("Horizons:", CONFIG.horizon_minutes)
+    print("Seeds:", CONFIG.multi_horizon_seeds)
+    print("Models: Persistence, Multimodal CNN-LSTM, Proposed TemporalViT")
     print("=" * 90)
 
     horizon_rows: List[Dict[str, Any]] = []
     horizon_test_rows: List[Dict[str, Any]] = []
+    skill_rows: List[Dict[str, Any]] = []
+    relative_rows: List[Dict[str, Any]] = []
 
     for horizon_minutes in CONFIG.horizon_minutes:
         horizon_steps = minutes_to_steps(horizon_minutes)
         horizon_split = fixed_split_for_horizon(horizon_steps)
         split_counts = {key: len(value) for key, value in horizon_split.items()}
+        if any(count == 0 for count in split_counts.values()):
+            raise RuntimeError(
+                f"Horizon {horizon_minutes} minutes produced an empty split: {split_counts}."
+            )
+
         save_json(
             {
                 "horizon_minutes": horizon_minutes,
                 "horizon_steps": horizon_steps,
+                "sampling_interval_minutes": SAMPLING_INTERVAL_MINUTES,
+                "seeds": CONFIG.multi_horizon_seeds,
                 **split_counts,
             },
             TABLE_DIR / f"multi_horizon_{horizon_minutes:02d}min_split_summary.json",
         )
 
-        for seed in CONFIG.multi_horizon_seeds:
-            loaders = build_loader_bundle(horizon_split, horizon_steps, seed)
+        loaders_by_seed = {
+            seed: build_loader_bundle(horizon_split, horizon_steps, seed)
+            for seed in CONFIG.multi_horizon_seeds
+        }
+        group_name = f"multi_horizon_{horizon_minutes:02d}min_seeded"
 
+        # The principal 10-minute CNN-LSTM and TemporalViT runs are identical
+        # to the main benchmark. Reuse them so Figure 5, Figure 11, and the
+        # ablation reference all report exactly the same seeded checkpoints.
+        if horizon_minutes == CONFIG.forecast_horizon_minutes and main_results:
+            horizon_model_results = run_model_set(
+                MODEL_SPECS,
+                ("persistence",),
+                CONFIG.multi_horizon_seeds,
+                loaders_by_seed,
+                experiment_group=group_name,
+            )
             for model_key in ("cnn_lstm_baseline", "temporal_vit_proposed"):
-                spec = MODEL_SPECS[model_key]
-                try:
-                    # The one-minute result is identical to the main benchmark.
-                    if horizon_minutes == CONFIG.forecast_horizon_minutes:
-                        result = main_results.get((model_key, seed))
-                        if result is None:
-                            result = train_or_load_model(
-                                spec,
-                                seed,
-                                loaders,
-                                experiment_group="main_benchmarks",
-                            )
+                for seed in CONFIG.multi_horizon_seeds:
+                    existing = main_results.get((model_key, seed))
+                    if existing is not None:
+                        horizon_model_results[(model_key, seed)] = existing
                     else:
-                        group_name = f"multi_horizon_{horizon_minutes:02d}min"
-                        result = train_or_load_model(spec, seed, loaders, group_name)
-
-                    multi_horizon_results[(horizon_minutes, model_key, seed)] = result
-                    row = {
-                        "horizon_minutes": horizon_minutes,
-                        "horizon_steps": horizon_steps,
-                        "train_sequences": len(horizon_split["train"]),
-                        "validation_sequences": len(horizon_split["val"]),
-                        "test_sequences": len(horizon_split["test"]),
-                        "model_key": model_key,
-                        "model": spec.label,
-                        "seed": seed,
-                        "best_epoch": result.best_epoch,
-                        "total_training_seconds": result.total_training_seconds,
-                    }
-                    row.update(result.metrics)
-                    horizon_rows.append(row)
-                except Exception as exc:
-                    record_failed_run(
-                        f"multi_horizon_{horizon_minutes:02d}min",
-                        model_key,
-                        seed,
-                        exc,
-                    )
-                    if not CONFIG.continue_on_error:
-                        raise
-                finally:
-                    cleanup_memory()
-
-            baseline = multi_horizon_results.get(
-                (horizon_minutes, "cnn_lstm_baseline", seed)
+                        reset_loader_generators(loaders_by_seed[seed], seed)
+                        horizon_model_results[(model_key, seed)] = train_or_load_model(
+                            MODEL_SPECS[model_key],
+                            seed,
+                            loaders_by_seed[seed],
+                            experiment_group=group_name,
+                        )
+        else:
+            horizon_model_results = run_model_set(
+                MODEL_SPECS,
+                CONFIG.multi_horizon_models,
+                CONFIG.multi_horizon_seeds,
+                loaders_by_seed,
+                experiment_group=group_name,
             )
-            proposed = multi_horizon_results.get(
-                (horizon_minutes, "temporal_vit_proposed", seed)
-            )
-            if baseline is not None and proposed is not None:
-                targets, baseline_preds, proposed_preds = align_predictions(
-                    baseline, proposed
-                )
-                baseline_abs = np.abs(baseline_preds - targets)
-                proposed_abs = np.abs(proposed_preds - targets)
-                try:
-                    test = wilcoxon(
-                        baseline_abs,
-                        proposed_abs,
-                        alternative="greater",
-                        zero_method="wilcox",
-                    )
-                    statistic = float(test.statistic)
-                    p_value = float(test.pvalue)
-                except ValueError:
-                    statistic = float("nan")
-                    p_value = float("nan")
-                permutation = paired_sign_flip_permutation_test(
-                    baseline_abs,
-                    proposed_abs,
-                    CONFIG.permutation_repetitions,
-                    seed + horizon_minutes,
-                )
-                horizon_test_rows.append(
-                    {
-                        "horizon_minutes": horizon_minutes,
-                        "seed": seed,
-                        "baseline_mae": float(np.mean(baseline_abs)),
-                        "proposed_mae": float(np.mean(proposed_abs)),
-                        "proposed_mae_reduction_percent": float(
-                            100.0
-                            * (np.mean(baseline_abs) - np.mean(proposed_abs))
-                            / max(np.mean(baseline_abs), 1e-12)
-                        ),
-                        "wilcoxon_statistic": statistic,
-                        "wilcoxon_one_sided_p_value": p_value,
-                        **permutation,
-                    }
-                )
 
-    horizon_long = pd.DataFrame(horizon_rows)
-    if not horizon_long.empty:
-        horizon_long.to_csv(
-            TABLE_DIR / "multi_horizon_results_all_seeds.csv", index=False
-        )
-
-        summary_rows: List[Dict[str, Any]] = []
-        for (horizon, model_key, model), group in horizon_long.groupby(
-            ["horizon_minutes", "model_key", "model"], sort=True
-        ):
-            row = {
-                "horizon_minutes": int(horizon),
+        for (model_key, seed), result in horizon_model_results.items():
+            multi_horizon_results[(horizon_minutes, model_key, seed)] = result
+            row: Dict[str, Any] = {
+                "horizon_minutes": int(horizon_minutes),
+                "horizon_steps": int(horizon_steps),
+                "train_sequences": len(horizon_split["train"]),
+                "validation_sequences": len(horizon_split["val"]),
+                "test_sequences": len(horizon_split["test"]),
                 "model_key": model_key,
-                "model": model,
-                "runs": len(group),
-                "test_sequences": int(group["test_sequences"].iloc[0]),
+                "model": result.model_label,
+                "seed": int(seed),
+                "best_epoch": result.best_epoch,
+                "total_training_seconds": result.total_training_seconds,
+                "parameter_count": count_parameters(result.model),
             }
-            for metric in ("mae", "mse", "rmse", "r2", "mbe", "pearson_r"):
-                row[f"{metric}_mean"] = float(group[metric].mean())
-                row[f"{metric}_std"] = (
-                    float(group[metric].std(ddof=1)) if len(group) > 1 else 0.0
-                )
-            summary_rows.append(row)
-        multi_horizon_summary = pd.DataFrame(summary_rows)
+            row.update(result.metrics)
+            horizon_rows.append(row)
 
-        # Quantify degradation relative to one-minute forecasting.
-        for model_key in ("cnn_lstm_baseline", "temporal_vit_proposed"):
-            model_mask = multi_horizon_summary["model_key"] == model_key
-            one_minute = multi_horizon_summary[
-                model_mask
-                & (
-                    multi_horizon_summary["horizon_minutes"]
-                    == CONFIG.forecast_horizon_minutes
-                )
-            ]
-            if one_minute.empty:
-                continue
-            reference = one_minute.iloc[0]
-            multi_horizon_summary.loc[
-                model_mask, "mae_increase_vs_1min_percent"
-            ] = (
-                (
-                    multi_horizon_summary.loc[model_mask, "mae_mean"]
-                    - reference["mae_mean"]
-                )
-                / max(reference["mae_mean"], 1e-12)
-                * 100.0
-            )
-            multi_horizon_summary.loc[
-                model_mask, "rmse_increase_vs_1min_percent"
-            ] = (
-                (
-                    multi_horizon_summary.loc[model_mask, "rmse_mean"]
-                    - reference["rmse_mean"]
-                )
-                / max(reference["rmse_mean"], 1e-12)
-                * 100.0
-            )
-            multi_horizon_summary.loc[model_mask, "r2_change_vs_1min"] = (
-                multi_horizon_summary.loc[model_mask, "r2_mean"]
-                - reference["r2_mean"]
-            )
+        persistence_candidates = [
+            result for (key, _), result in horizon_model_results.items()
+            if key == "persistence"
+        ]
+        persistence = persistence_candidates[0] if persistence_candidates else None
 
-        # Proposed-model advantage over the CNN-LSTM at each horizon.
-        relative_rows: List[Dict[str, Any]] = []
-        for horizon in sorted(multi_horizon_summary["horizon_minutes"].unique()):
-            base = multi_horizon_summary[
-                (multi_horizon_summary["horizon_minutes"] == horizon)
-                & (multi_horizon_summary["model_key"] == "cnn_lstm_baseline")
-            ]
-            prop = multi_horizon_summary[
-                (multi_horizon_summary["horizon_minutes"] == horizon)
-                & (multi_horizon_summary["model_key"] == "temporal_vit_proposed")
-            ]
-            if base.empty or prop.empty:
-                continue
-            base_row, prop_row = base.iloc[0], prop.iloc[0]
-            relative_rows.append(
-                {
-                    "horizon_minutes": int(horizon),
-                    "proposed_mae_reduction_percent": float(
-                        100.0
-                        * (base_row["mae_mean"] - prop_row["mae_mean"])
-                        / max(base_row["mae_mean"], 1e-12)
-                    ),
-                    "proposed_rmse_reduction_percent": float(
-                        100.0
-                        * (base_row["rmse_mean"] - prop_row["rmse_mean"])
-                        / max(base_row["rmse_mean"], 1e-12)
-                    ),
-                    "proposed_r2_difference": float(
-                        prop_row["r2_mean"] - base_row["r2_mean"]
-                    ),
-                }
+        for seed in CONFIG.multi_horizon_seeds:
+            cnn = horizon_model_results.get(("cnn_lstm_baseline", seed))
+            proposed = horizon_model_results.get(("temporal_vit_proposed", seed))
+
+            if persistence is not None:
+                for candidate in (cnn, proposed):
+                    if candidate is None:
+                        continue
+                    horizon_test_rows.append(
+                        paired_error_test_row(horizon_minutes, seed, persistence, candidate)
+                    )
+                    skill_rows.append(
+                        {
+                            "horizon_minutes": int(horizon_minutes),
+                            "seed": int(seed),
+                            "model_key": candidate.model_key,
+                            "model": candidate.model_label,
+                            "mae_skill_vs_persistence": float(
+                                1.0 - candidate.metrics["mae"] / max(persistence.metrics["mae"], 1e-12)
+                            ),
+                            "rmse_skill_vs_persistence": float(
+                                1.0 - candidate.metrics["rmse"] / max(persistence.metrics["rmse"], 1e-12)
+                            ),
+                            "mae_reduction_vs_persistence_percent": float(
+                                100.0 * (persistence.metrics["mae"] - candidate.metrics["mae"])
+                                / max(persistence.metrics["mae"], 1e-12)
+                            ),
+                            "rmse_reduction_vs_persistence_percent": float(
+                                100.0 * (persistence.metrics["rmse"] - candidate.metrics["rmse"])
+                                / max(persistence.metrics["rmse"], 1e-12)
+                            ),
+                            "r2_difference_vs_persistence": float(
+                                candidate.metrics["r2"] - persistence.metrics["r2"]
+                            ),
+                        }
+                    )
+
+            if cnn is not None and proposed is not None:
+                horizon_test_rows.append(
+                    paired_error_test_row(horizon_minutes, seed, cnn, proposed)
+                )
+                relative_rows.append(
+                    {
+                        "horizon_minutes": int(horizon_minutes),
+                        "seed": int(seed),
+                        "proposed_mae_reduction_vs_cnn_lstm_percent": float(
+                            100.0 * (cnn.metrics["mae"] - proposed.metrics["mae"])
+                            / max(cnn.metrics["mae"], 1e-12)
+                        ),
+                        "proposed_rmse_reduction_vs_cnn_lstm_percent": float(
+                            100.0 * (cnn.metrics["rmse"] - proposed.metrics["rmse"])
+                            / max(cnn.metrics["rmse"], 1e-12)
+                        ),
+                        "proposed_r2_difference_vs_cnn_lstm": float(
+                            proposed.metrics["r2"] - cnn.metrics["r2"]
+                        ),
+                    }
+                )
+        cleanup_memory()
+
+    multi_horizon_long = pd.DataFrame(horizon_rows)
+    multi_horizon_summary = aggregate_multi_horizon_frame(multi_horizon_long)
+    multi_horizon_long.to_csv(
+        TABLE_DIR / "multi_horizon_results_all_seeds.csv", index=False
+    )
+    multi_horizon_summary.to_csv(
+        TABLE_DIR / "multi_horizon_results_mean_std.csv", index=False
+    )
+
+    multi_horizon_skill_long = pd.DataFrame(skill_rows)
+    multi_horizon_skill_scores = aggregate_skill_frame(multi_horizon_skill_long)
+    multi_horizon_skill_long.to_csv(
+        TABLE_DIR / "multi_horizon_skill_scores_vs_persistence_all_seeds.csv",
+        index=False,
+    )
+    multi_horizon_skill_scores.to_csv(
+        TABLE_DIR / "multi_horizon_skill_scores_vs_persistence_mean_std.csv",
+        index=False,
+    )
+
+    relative_long = pd.DataFrame(relative_rows)
+    relative_long.to_csv(
+        TABLE_DIR / "multi_horizon_proposed_vs_cnn_lstm_all_seeds.csv", index=False
+    )
+    if not relative_long.empty:
+        relative_summary = (
+            relative_long.groupby("horizon_minutes", as_index=False)
+            .agg(
+                runs=("seed", "nunique"),
+                proposed_mae_reduction_vs_cnn_lstm_percent_mean=(
+                    "proposed_mae_reduction_vs_cnn_lstm_percent", "mean"
+                ),
+                proposed_mae_reduction_vs_cnn_lstm_percent_std=(
+                    "proposed_mae_reduction_vs_cnn_lstm_percent", "std"
+                ),
+                proposed_rmse_reduction_vs_cnn_lstm_percent_mean=(
+                    "proposed_rmse_reduction_vs_cnn_lstm_percent", "mean"
+                ),
+                proposed_rmse_reduction_vs_cnn_lstm_percent_std=(
+                    "proposed_rmse_reduction_vs_cnn_lstm_percent", "std"
+                ),
+                proposed_r2_difference_vs_cnn_lstm_mean=(
+                    "proposed_r2_difference_vs_cnn_lstm", "mean"
+                ),
+                proposed_r2_difference_vs_cnn_lstm_std=(
+                    "proposed_r2_difference_vs_cnn_lstm", "std"
+                ),
             )
-        pd.DataFrame(relative_rows).to_csv(
-            TABLE_DIR / "multi_horizon_relative_improvements.csv", index=False
         )
-        multi_horizon_summary.to_csv(
-            TABLE_DIR / "multi_horizon_results_mean_std.csv", index=False
-        )
-
-        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-        for model_key, label in [
-            ("cnn_lstm_baseline", "CNN-LSTM baseline"),
-            ("temporal_vit_proposed", "Proposed TemporalViT"),
-        ]:
-            frame = multi_horizon_summary[
-                multi_horizon_summary["model_key"] == model_key
-            ].sort_values("horizon_minutes")
-            axes[0].errorbar(
-                frame["horizon_minutes"],
-                frame["mae_mean"],
-                yerr=frame["mae_std"],
-                marker="o",
-                capsize=3,
-                label=label,
-            )
-            axes[1].errorbar(
-                frame["horizon_minutes"],
-                frame["rmse_mean"],
-                yerr=frame["rmse_std"],
-                marker="o",
-                capsize=3,
-                label=label,
-            )
-            axes[2].errorbar(
-                frame["horizon_minutes"],
-                frame["r2_mean"],
-                yerr=frame["r2_std"],
-                marker="o",
-                capsize=3,
-                label=label,
-            )
-        for axis, ylabel, title in zip(
-            axes,
-            ["MAE", "RMSE", "R²"],
-            [
-                "(a) Mean Absolute Error",
-                "(b) Root Mean Squared Error",
-                "(c) Coefficient of Determination",
-            ],
-        ):
-            axis.set_xlabel("Forecast horizon (minutes)")
-            axis.set_ylabel(ylabel)
-            axis.set_title(title)
-            axis.grid(True, alpha=0.3)
-            axis.legend()
-        save_figure(fig, "Fig09_multi_horizon_performance")
+    else:
+        relative_summary = pd.DataFrame()
+    relative_summary.to_csv(
+        TABLE_DIR / "multi_horizon_proposed_vs_cnn_lstm_mean_std.csv", index=False
+    )
 
     multi_horizon_tests = pd.DataFrame(horizon_test_rows)
     multi_horizon_tests.to_csv(
         TABLE_DIR / "multi_horizon_paired_statistical_tests.csv", index=False
     )
+
+    # Figure 11: mean ± standard deviation across seeded runs.
+    if not multi_horizon_summary.empty:
+        fig, axes = plt.subplots(1, 3, figsize=(19.8, 6.1))
+        plot_models = [
+            ("persistence", "Persistence"),
+            ("cnn_lstm_baseline", "Multimodal CNN-LSTM"),
+            ("temporal_vit_proposed", "Proposed TemporalViT"),
+        ]
+        panels = [
+            ("mae_mean", "mae_std", "MAE", "(a) Mean absolute error"),
+            ("rmse_mean", "rmse_std", "RMSE", "(b) Root mean squared error"),
+            ("r2_mean", "r2_std", "R²", "(c) Coefficient of determination"),
+        ]
+        for model_key, label in plot_models:
+            frame = multi_horizon_summary[
+                multi_horizon_summary["model_key"] == model_key
+            ].sort_values("horizon_minutes")
+            if frame.empty:
+                continue
+            for axis, (mean_col, std_col, _, _) in zip(axes, panels):
+                axis.errorbar(
+                    frame["horizon_minutes"],
+                    frame[mean_col],
+                    yerr=frame[std_col],
+                    marker="o",
+                    capsize=4,
+                    color=MODEL_COLORS[model_key],
+                    label=label,
+                )
+        for axis, (_, _, ylabel, title) in zip(axes, panels):
+            axis.set_xticks(list(CONFIG.horizon_minutes))
+            axis.set_xlabel("Forecast horizon (minutes)")
+            axis.set_ylabel(ylabel)
+            axis.set_title(title)
+            style_axis(axis)
+        axes[2].set_ylim(
+            min(0.0, float(multi_horizon_summary["r2_mean"].min()) - 0.01),
+            1.002,
+        )
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.03))
+        fig.suptitle("Seeded multi-horizon forecasting comparison", y=1.075)
+        save_figure(fig, "Fig11_multi_horizon_5_10_12_mean_std")
+
+    # Supplementary skill-score figure relative to persistence.
+    if not multi_horizon_skill_scores.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.8))
+        for model_key, label in (
+            ("cnn_lstm_baseline", "Multimodal CNN-LSTM"),
+            ("temporal_vit_proposed", "Proposed TemporalViT"),
+        ):
+            frame = multi_horizon_skill_scores[
+                multi_horizon_skill_scores["model_key"] == model_key
+            ].sort_values("horizon_minutes")
+            if frame.empty:
+                continue
+            for axis, metric in zip(
+                axes,
+                ("mae_skill_vs_persistence", "rmse_skill_vs_persistence"),
+            ):
+                axis.errorbar(
+                    frame["horizon_minutes"],
+                    frame[f"{metric}_mean"],
+                    yerr=frame[f"{metric}_std"],
+                    marker="o",
+                    capsize=4,
+                    color=MODEL_COLORS[model_key],
+                    label=label,
+                )
+        for axis, ylabel, title in zip(
+            axes,
+            ("MAE skill score", "RMSE skill score"),
+            ("(a) MAE skill relative to persistence", "(b) RMSE skill relative to persistence"),
+        ):
+            axis.axhline(0.0, color="#111827", linestyle="--", linewidth=1.1)
+            axis.set_xticks(list(CONFIG.horizon_minutes))
+            axis.set_xlabel("Forecast horizon (minutes)")
+            axis.set_ylabel(ylabel)
+            axis.set_title(title)
+            style_axis(axis)
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.04))
+        save_figure(fig, "SuppFig_multi_horizon_skill_vs_persistence_mean_std")
 
 
 # ============================================================
@@ -3061,7 +3535,7 @@ if CONFIG.run_data_size_study:
             axis.set_title(title)
             axis.grid(True, alpha=0.3)
             axis.legend()
-        save_figure(fig, "Fig14_data_size_study")
+        save_figure(fig, "Fig15_data_size_study")
 
 
 # ============================================================
@@ -3278,7 +3752,7 @@ if CONFIG.run_daywise_ramp_analysis and main_results:
             axis.set_title(title)
             axis.grid(True, axis="y", alpha=0.3)
             axis.legend()
-        save_figure(fig, "Fig15_ramp_event_error_analysis")
+        save_figure(fig, "Fig16_ramp_event_error_analysis")
 
 
 # ============================================================
@@ -3404,7 +3878,12 @@ if not ablation_summary.empty:
 
 if not multi_horizon_summary.empty:
     writing_lines.extend(
-        ["", "3. Multi-horizon forecasting", multi_horizon_summary.to_string(index=False)]
+        ["", "3. Multi-horizon forecasting (mean ± SD across seeds 42, 52, and 62)", multi_horizon_summary.to_string(index=False)]
+    )
+
+if not multi_horizon_skill_scores.empty:
+    writing_lines.extend(
+        ["", "4. Multi-horizon skill relative to persistence", multi_horizon_skill_scores.to_string(index=False)]
     )
 
 if not data_size_summary.empty:
@@ -3437,14 +3916,16 @@ manifest_rows = [
     ("Main benchmark", "main_benchmark_results_mean_std.csv", "Table: overall performance"),
     ("Forecast skill", "forecast_skill_relative_to_persistence.csv", "Table: improvement over persistence"),
     ("Paired tests", "paired_statistical_tests.csv", "Table: CNN-LSTM versus proposed"),
-    ("Efficiency", "computational_efficiency_results.csv", "Table/Figure 12"),
-    ("Ablation", "ablation_results_mean_std.csv", "Table/Figure 13"),
+    ("Efficiency", "computational_efficiency_results.csv", "Table/Figure 13"),
+    ("Ablation", "ablation_results_mean_std.csv", "Table/Figure 14"),
     ("Ablation tests", "ablation_paired_statistical_tests.csv", "Statistical support for ablations"),
-    ("Multi-horizon", "multi_horizon_results_mean_std.csv", "Table/Figure 9"),
+    ("Multi-horizon", "multi_horizon_results_mean_std.csv", "Table/Figure 11"),
+    ("Horizon skill", "multi_horizon_skill_scores_vs_persistence_mean_std.csv", "Skill relative to persistence"),
+    ("Proposed vs CNN-LSTM", "multi_horizon_proposed_vs_cnn_lstm_mean_std.csv", "Per-horizon model comparison"),
     ("Horizon tests", "multi_horizon_paired_statistical_tests.csv", "Per-horizon statistical tests"),
-    ("Data size", "data_size_results_mean_std.csv", "Table/Figure 14"),
+    ("Data size", "data_size_results_mean_std.csv", "Supplementary Figure 15"),
     ("Day-wise", "daywise_metrics_mean_std.csv", "Error analysis"),
-    ("Ramp events", "ramp_event_results_mean_std.csv", "Table/Figure 15"),
+    ("Ramp events", "ramp_event_results_mean_std.csv", "Supplementary Figure 16"),
     ("Block bootstrap", "day_block_bootstrap_95_confidence_intervals.csv", "95% confidence intervals"),
 ]
 manifest = pd.DataFrame(manifest_rows, columns=["analysis", "file", "use_in_section_4"])
@@ -3463,14 +3944,11 @@ summary_lines = [
     f"Device: {CONFIG.device}",
     f"Sampling interval (minutes): {SAMPLING_INTERVAL_MINUTES:.4f}",
     f"Sequence length: {CONFIG.sequence_length}",
-    f"Primary forecast horizon: {CONFIG.forecast_horizon_minutes} minute(s)",
+    f"Reference split horizon: {CONFIG.forecast_horizon_minutes} minute(s)",
     f"Multi-horizon values: {CONFIG.horizon_minutes}",
     f"Epochs: {CONFIG.epochs}",
     f"Early stopping patience: {CONFIG.early_stop_patience}",
-    f"Main seeds: {CONFIG.main_seeds}",
-    f"Ablation seeds: {CONFIG.ablation_seeds}",
     f"Multi-horizon seeds: {CONFIG.multi_horizon_seeds}",
-    f"Data-size seeds: {CONFIG.data_size_seeds}",
     f"Train sequences: {len(main_split_starts['train'])}",
     f"Validation sequences: {len(main_split_starts['val'])}",
     f"Test sequences: {len(main_split_starts['test'])}",
@@ -3488,6 +3966,7 @@ for heading, frame in [
     ("Computational efficiency", efficiency_frame),
     ("Ablation mean ± std", ablation_summary),
     ("Multi-horizon mean ± std", multi_horizon_summary),
+    ("Multi-horizon skill vs persistence", multi_horizon_skill_scores),
     ("Data-size mean ± std", data_size_summary),
     ("Ramp-event mean ± std", ramp_summary),
 ]:
